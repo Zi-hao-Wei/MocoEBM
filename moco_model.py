@@ -5,6 +5,58 @@ import torch
 import numpy as np
 import copy
 
+im_sz = 32
+n_ch = 3
+n_classes=10
+reinit_freq=0.05
+sgld_lr=1.0
+sgld_std=1e-2
+n_steps=20
+
+
+def init_random(bs):
+    return torch.FloatTensor(bs, n_ch, im_sz, im_sz).uniform_(-1, 1)
+
+def get_buffer(buffer_size):
+    replay_buffer = init_random(buffer_size)
+    return replay_buffer
+
+def get_sample_q(device):
+    def sample_p_0(replay_buffer, bs, y=None):
+        if len(replay_buffer) == 0:
+            return init_random(bs), []
+        buffer_size = len(replay_buffer) if y is None else len(replay_buffer) // n_classes
+        inds = torch.randint(0, buffer_size, (bs,))
+        # if cond, convert inds to class conditional inds
+        if y is not None:
+            inds = y.cpu() * buffer_size + inds
+        buffer_samples = replay_buffer[inds]
+        random_samples = init_random(bs)
+        choose_random = (torch.rand(bs) < reinit_freq).float()[:, None, None, None]
+        samples = choose_random * random_samples + (1 - choose_random) * buffer_samples
+        return samples.to(device), inds
+
+    def sample_q(f, replay_buffer, batch_size, y=None, n_steps=n_steps):
+        f.eval()
+        # get batch size
+        bs = batch_size if y is None else y.size(0)
+        # generate initial samples and buffer inds of those samples (if buffer is used)
+        init_sample, buffer_inds = sample_p_0(replay_buffer, bs=bs, y=y)
+        x_k = torch.autograd.Variable(init_sample, requires_grad=True)
+        
+        # sgld
+        for k in range(n_steps):
+            #TODO Change to MoCOEBM
+            f_prime = torch.autograd.grad(f(x_k, y=y).sum(), [x_k], retain_graph=True)[0]
+            x_k.data += sgld_lr * f_prime + sgld_std * torch.randn_like(x_k)
+        f.train()
+        final_samples = x_k.detach()
+        # update replay buffer
+        if len(replay_buffer) > 0:
+            replay_buffer[buffer_inds] = final_samples.cpu()
+        return final_samples
+    return sample_q
+
 
 class MocoModel(pl.LightningModule):
     def __init__(self, memory_bank_size, moco_max_epochs, downstream_max_epochs=0, dataloader_train_classifier=None,
