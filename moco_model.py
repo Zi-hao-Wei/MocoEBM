@@ -5,8 +5,10 @@ import torch
 import numpy as np
 import copy
 
+
 class MocoModel(pl.LightningModule):
-    def __init__(self, memory_bank_size, moco_max_epochs, downstream_max_epochs=0, dataloader_train_classifier=None, dataloader_test=None, downstream_test_every=0):
+    def __init__(self, memory_bank_size, moco_max_epochs, downstream_max_epochs=0, dataloader_train_classifier=None,
+                 dataloader_test=None, downstream_test_every=0):
         super().__init__()
 
         self.moco_max_epochs = moco_max_epochs
@@ -16,7 +18,7 @@ class MocoModel(pl.LightningModule):
         self.downstream_test_every = downstream_test_every
 
         # create a ResNet backbone and remove the classification head
-        #TODO: Change backbone
+        # TODO: Change backbone
         resnet = lightly.models.ResNetGenerator('resnet-18', 1, num_splits=8)
         backbone = nn.Sequential(
             *list(resnet.children())[:-1],
@@ -46,13 +48,13 @@ class MocoModel(pl.LightningModule):
     # freeze backbone and train a few linear layers to see progress
     def test_downstream_training(self):
         # copy moco and make classifier
-        classifier = Classifier(copy.deepcopy(self.resnet_moco), max_epochs = self.downstream_max_epochs)
-        trainer = pl.Trainer(max_epochs = self.downstream_max_epochs, gpus=1, logger=None)
+        classifier = Classifier(copy.deepcopy(self.resnet_moco), max_epochs=self.downstream_max_epochs)
+        trainer = pl.Trainer(max_epochs=self.downstream_max_epochs, gpus=1, logger=None)
         trainer.fit(
-                classifier,
-                self.dataloader_train_classifier,
-                self.dataloader_test
-                )
+            classifier,
+            self.dataloader_train_classifier,
+            self.dataloader_test
+        )
         train_losses = classifier.train_losses[1:]
         val_accs = classifier.val_accs[1:]
         print(train_losses)
@@ -63,34 +65,47 @@ class MocoModel(pl.LightningModule):
         self.log('DOWNSTREAM_min_train_loss', min_train_loss)
         self.log('DOWNSTREAM_max_val_acc', max_val_acc)
 
-    def training_step(self, batch, batch_idx):
-        (x0, x1), _, _ = batch #2N
+    def training_step(self, batch, batch_idx, temp, lam):
+        (x0, x1), _, _ = batch  # 2N
 
         y0, y1 = self.resnet_moco(x0, x1)
         loss = self.criterion(y0, y1)
 
-        #TODO Add generating process
-        #JEM => v N*1
-        
-        #TODO V_m torch.cat(y0,y1,dim=0) 
-        #Repeat N*2N*F
+        # TODO Add generating process
+        # JEM => v N*1
+
+        # TODO V_m torch.cat(y0,y1,dim=0)
+        # Repeat N*2N*F
         # v: N*1*F
-        
+
         # Vx = v - v_m => N*2N*F
         # torch.norm(Vx.reshape(N,-1),dim=-1) N*1
         # 赋值，对角线，算 Zn;{Z'm}
         # Positive Energy
+        N, F = x0.shape
+        x_concat = torch.concat([x0, x1], dim=0)  # 2N, F
+        x_concat = torch.stack([x_concat] * N)  # N, 2N, F
+        real_logits = (x0 - x_concat).resize(N, -1)  # N, 2N*F
+        real_logits = torch.norm(real_logits, dim=-1)
+        real_logits = nn.LogSoftmax(real_logits / temp)
 
         # Negative Energy
+        x_concat[torch.arange(N), torch.arange(N), :] = v
+        fake_logits = (v - x_concat).resize(N, -1)  # N, 2N*F
+        fake_logits = torch.norm(fake_logits, dim=-1)
+        fake_logits = nn.LogSoftmax(fake_logits / temp)
 
         # Energy Loss
+        energy_loss = lam * (fake_logits - real_logits)
+        loss = loss + energy_loss
         # Loss Sum
         self.log('train_loss_ssl', loss)
+        self.log('energy+loss', energy_loss)
         return loss
 
     def training_epoch_end(self, outputs):
         self.custom_histogram_weights()
-        if self.current_epoch%self.downstream_test_every == 0:
+        if self.current_epoch % self.downstream_test_every == 0:
             print('... training downstream classifier...')
             self.test_downstream_training()
 
@@ -119,10 +134,10 @@ class Classifier(pl.LightningModule):
         # we create a linear layer for our downstream classification
         # model
         self.fc = nn.Sequential(
-                nn.Linear(512, 512),
-                nn.ReLU(),
-                nn.Linear(512, 10)
-                )
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 10)
+        )
 
         self.accuracy = pl.metrics.Accuracy()
 
@@ -147,7 +162,7 @@ class Classifier(pl.LightningModule):
         self.log('train_loss_fc', loss)
         self.epoch_train_losses.append(loss.cpu().detach())
         return loss
-    
+
     # TODO: logging histogram doesnt work when using nn.Sequenial for model fc
     # def training_epoch_end(self, outputs):
     #     self.custom_histogram_weights()
