@@ -132,7 +132,7 @@ class MocoModel(pl.LightningModule):
         self.log('DOWNSTREAM_min_train_loss', min_train_loss)
         self.log('DOWNSTREAM_max_val_acc', max_val_acc)
 
-    def training_step(self, batch, batch_idx, temp=1, lam=0.1, upper_bound=1.0):
+    def training_step(self, batch, batch_idx, temp=0.1, lam=0.1, upper_bound=1.0):
         (x0, x1), _, _ = batch  # 2N
 
         y0, y1 = self.resnet_moco(x0, x1)
@@ -172,7 +172,7 @@ class MocoModel(pl.LightningModule):
         loss = loss + energy_loss
         # Loss Sum
         self.log('train_loss_ssl', loss)
-        self.log('energy+loss', energy_loss)
+        self.log('energy_loss', energy_loss)
         return loss
 
     def training_epoch_end(self, outputs):
