@@ -25,7 +25,10 @@ def get_buffer(buffer_size=buffer_size):
     return replay_buffer
 
 
-def get_sample_q(device):
+def get_sample_q():
+    def __init__(self, device):
+      self.device = device
+
     def sample_p_0(replay_buffer, bs=batch_size, y=None):
         if len(replay_buffer) == 0:
             return init_random(bs), []
@@ -99,7 +102,7 @@ class MocoModel(pl.LightningModule):
             temperature=0.1,
             memory_bank_size=memory_bank_size)
         # TODO Change the losses
-        self.sample_q = get_sample_q(device=torch.cuda())
+        self.sample_q = get_sample_q()
         self.replay_buffer = get_buffer()
 
     def forward(self, x):
