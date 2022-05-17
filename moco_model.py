@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch
 import numpy as np
 import copy
-
+import torch.nn.functional as func
 im_sz = 32
 n_ch = 3
 n_classes = 10
@@ -12,8 +12,8 @@ reinit_freq = 0.05
 sgld_lr = 1.0
 sgld_std = 1e-2
 n_steps = 20
-batch_size = 512
-buffer_size = 10000
+batch_size = 16
+buffer_size = 1000
 
 
 def init_random(bs):
@@ -24,54 +24,46 @@ def get_buffer(buffer_size=buffer_size):
     replay_buffer = init_random(buffer_size)
     return replay_buffer
 
+def sample_p_0(replay_buffer,bs=batch_size, y=None):
+    if len(replay_buffer) == 0:
+        return init_random(bs), []
+    buffer_size = len(replay_buffer) if y is None else len(replay_buffer) // n_classes
+    inds = torch.randint(0, buffer_size, (bs,))
+    # if cond, convert inds to class conditional inds
+            
+    buffer_samples = replay_buffer[inds]
+    random_samples = init_random(bs)
+    choose_random = (torch.rand(bs) < reinit_freq).float()[:, None, None, None]
+    samples = choose_random * random_samples + (1 - choose_random) * buffer_samples
+    return samples.cuda(), inds
 
-def get_sample_q():
-    def __init__(self, device):
-      self.device = device
+def sample_q(f, replay_buffer, temp=0.1, upper_bound=1.0, y=None, n_steps=n_steps):
+    f.eval()
+    # get batch size
+    N = batch_size if y is None else y.size(0)
+    # generate initial samples and buffer inds of those samples (if buffer is used)
+    init_sample, buffer_inds = sample_p_0(replay_buffer, bs=N, y=y)
+    x_k = torch.autograd.Variable(init_sample, requires_grad=True)
 
-    def sample_p_0(replay_buffer, bs=batch_size, y=None):
-        if len(replay_buffer) == 0:
-            return init_random(bs), []
-        buffer_size = len(replay_buffer) if y is None else len(replay_buffer) // n_classes
-        inds = torch.randint(0, buffer_size, (bs,))
-        # if cond, convert inds to class conditional inds
-        if y is not None:
-            inds = y.cpu() * buffer_size + inds
-        buffer_samples = replay_buffer[inds]
-        random_samples = init_random(bs)
-        choose_random = (torch.rand(bs) < reinit_freq).float()[:, None, None, None]
-        samples = choose_random * random_samples + (1 - choose_random) * buffer_samples
-        return samples.to(device), inds
+    # sgld
+    for k in range(n_steps):
+        # TODO Change to MoCOEBM
+        v = f(x_k)
+        y[torch.arange(N), torch.arange(N), :] = v
+        v = torch.concat([v, v], dim=0)
+        fake_logits = (v - y).reshape(N, -1)
+        fake_logits = -torch.norm(fake_logits, dim=-1) ** 2
+        energy =  -func.log_softmax(fake_logits / temp, dim=-1)
+        f_prime = torch.autograd.grad(energy, [x_k], grad_outputs=torch.ones_like(energy), retain_graph=True)[0]
+        f_prime = torch.clamp(f_prime, upper_bound, -upper_bound)
+        x_k.data += sgld_lr * f_prime + sgld_std * torch.randn_like(x_k)
 
-    def sample_q(f, replay_buffer, temp, upper_bound, y=None, n_steps=n_steps):
-        f.eval()
-        # get batch size
-        N = batch_size if y is None else y.size(0)
-        # generate initial samples and buffer inds of those samples (if buffer is used)
-        init_sample, buffer_inds = sample_p_0(replay_buffer, bs=N, y=y)
-        x_k = torch.autograd.Variable(init_sample, requires_grad=True)
-
-        # sgld
-        for k in range(n_steps):
-            # TODO Change to MoCOEBM
-            v = f(x_k)
-            y[torch.arange(N), torch.arange(N), :] = v
-            fake_logits = (v - y).resize(N, -1)
-            fake_logits = torch.norm(fake_logits, dim=-1) ** 2
-            energy = nn.LogSoftmax(fake_logits / temp)
-
-            f_prime = torch.autograd.grad(energy, [x_k], retain_graph=True)[0]
-            f_prime = torch.clamp(f_prime, upper_bound, -upper_bound)
-            x_k.data += sgld_lr * f_prime + sgld_std * torch.randn_like(x_k)
-
-        f.train()
-        final_samples = x_k.detach()
-        # update replay buffer
-        if len(replay_buffer) > 0:
-            replay_buffer[buffer_inds] = final_samples.cpu()
-        return final_samples
-
-    return sample_q
+    f.train()
+    final_samples = x_k.detach()
+    # update replay buffer
+    if len(replay_buffer) > 0:
+        replay_buffer[buffer_inds] = final_samples.cpu()
+    return final_samples
 
 
 class MocoModel(pl.LightningModule):
@@ -102,7 +94,6 @@ class MocoModel(pl.LightningModule):
             temperature=0.1,
             memory_bank_size=memory_bank_size)
         # TODO Change the losses
-        self.sample_q = get_sample_q()
         self.replay_buffer = get_buffer()
 
     def forward(self, x):
@@ -148,8 +139,8 @@ class MocoModel(pl.LightningModule):
         # torch.norm(Vx.reshape(N,-1),dim=-1) N*1
         # 赋值，对角线，算 Zn;{Z'm}
         # Positive Energy
-        y0, _ = y0
-        y1, _ = y1
+        y0 = y0
+        y1 = y1
         N, F = y0.shape
         y_concat = torch.concat([y0, y1], dim=0)  # 2N, F
         y_concat = torch.stack([y_concat] * N)  # N, 2N, F
@@ -157,22 +148,26 @@ class MocoModel(pl.LightningModule):
         # TODO V_m torch.cat(y0,y1,dim=0)
         # Repeat N*2N*F
         # v: N*1*F
-        v = self.sample_q(self.resenet_moco, self.replay_buffer, temp, upper_bound)  # N*3*W*H
-        (v, _) = self.resnet_moco(v)  # N*F
-
-        real_logits = (y0 - y_concat).resize(N, -1)  # N, 2N*F
-        real_logits = torch.norm(real_logits, dim=-1) ** 2
-        real_logits = nn.LogSoftmax(real_logits / temp)
+        v = sample_q(self.resnet_moco, self.replay_buffer, temp, upper_bound,y_concat)  # N*3*W*H
+        v = self.resnet_moco(v)  # N*F
+        y0 = torch.concat([y0, y0], dim=0)
+        real_logits = (y0 - y_concat).reshape(N, -1)  # N, 2N*F
+        real_logits = -torch.norm(real_logits, dim=-1) ** 2
+        real_logits = func.log_softmax(real_logits / temp,dim=-1)
 
         # Negative Energy
         y_concat[torch.arange(N), torch.arange(N), :] = v
-        fake_logits = (v - y_concat).resize(N, -1)  # N, 2N*F
-        fake_logits = torch.norm(fake_logits, dim=-1) ** 2
-        fake_logits = nn.LogSoftmax(fake_logits / temp)
+        v = torch.concat([v, v], dim=0)
+        fake_logits = (v - y_concat).reshape(N, -1)  # N, 2N*F
+        fake_logits = -torch.norm(fake_logits, dim=-1) ** 2
+        fake_logits = func.log_softmax(fake_logits / temp,dim=-1)
 
         # Energy Loss
         energy_loss = lam * (fake_logits - real_logits)
-        loss = loss + energy_loss
+        print("Contrastive",loss)
+        print("Energy Loss",energy_loss.mean())
+        loss = loss + energy_loss.mean()
+
         # Loss Sum
         self.log('train_loss_ssl', loss)
         self.log('energy_loss', energy_loss)
