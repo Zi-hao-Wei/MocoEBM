@@ -37,7 +37,7 @@ def sample_p_0(replay_buffer,bs=batch_size, y=None):
     samples = choose_random * random_samples + (1 - choose_random) * buffer_samples
     return samples.cuda(), inds
 
-def sample_q(f, replay_buffer, temp=10, upper_bound=1.0, y=None, n_steps=n_steps):
+def sample_q(f, replay_buffer, temp=0.1, upper_bound=1.0, y=None, n_steps=n_steps):
     f.eval()
     # get batch size
     N = batch_size if y is None else y.size(0)
@@ -49,30 +49,12 @@ def sample_q(f, replay_buffer, temp=10, upper_bound=1.0, y=None, n_steps=n_steps
     for k in range(n_steps):
         # TODO Change to MoCOEBM
         v = f(x_k)
-        # print("===========V=============")
-        # print(v.shape)
-        # print(v)
-        # print("===========Y=============")
-        # print(y)
         y[torch.arange(N), torch.arange(N), :] = v
-        v = torch.concat([v, v], dim=0)
-        fake_logits = (v - y)
-        # print("===========Fake Logits=============")
-        # print(fake_logits.shape) #N*2N*F
-        # print(fake_logits.shape) #N*2N*1
-       
+        # v = torch.stack([v]*2*N).permute(1,0,2)
+        v=torch.concat([v,v],dim=0)
+        fake_logits = (v - y).reshape(N, -1)
         fake_logits = -torch.norm(fake_logits, dim=-1) ** 2
-        fake_logits = fake_logits.reshape(N,-1)
-        print(fake_logits)
-        fake_logits = torch.exp(fake_logits / temp)
-        print(fake_logits)
-        energy =  -torch.log(torch.sum(fake_logits,dim=-1)-1/temp)
-
-        # energy =  -func.log_softmax(fake_logits / temp, dim=-1)
-
-
-        # energy= -func.log_softmax(fake_logits/ temp,dim=-1)
-        print("Energy",energy.mean())
+        energy =  -torch.log(torch.sum(torch.exp(fake_logits / temp),dim=-1))
         f_prime = torch.autograd.grad(energy, [x_k], grad_outputs=torch.ones_like(energy), retain_graph=True)[0]
         f_prime = torch.clamp(f_prime, upper_bound, -upper_bound)
         x_k.data += sgld_lr * f_prime + sgld_std * torch.randn_like(x_k)
@@ -145,7 +127,7 @@ class MocoModel(pl.LightningModule):
         self.log('DOWNSTREAM_min_train_loss', min_train_loss)
         self.log('DOWNSTREAM_max_val_acc', max_val_acc)
 
-    def training_step(self, batch, batch_idx, temp=10, lam=0.1, upper_bound=1.0):
+    def training_step(self, batch, batch_idx, temp=0.1, lam=0.1, upper_bound=1.0):
         (x0, x1), _, _ = batch  # 2N
 
         y0, y1 = self.resnet_moco(x0, x1)
@@ -163,46 +145,36 @@ class MocoModel(pl.LightningModule):
         N, F = y0.shape
         y_concat = torch.concat([y0, y1], dim=0)  # 2N, F
         y_concat = torch.stack([y_concat] * N)  # N, 2N, F
-        # print("----------------------------")
-        # print(y_concat.shape)
+
         # TODO V_m torch.cat(y0,y1,dim=0)
         # Repeat N*2N*F
         # v: N*1*F
-        v = sample_q(self.resnet_moco, self.replay_buffer, temp, upper_bound,y_concat.clone())  # N*3*W*H
-        # print(v)
+        v = sample_q(self.resnet_moco, self.replay_buffer, temp, upper_bound,y_concat)  # N*3*W*H
         v = self.resnet_moco(v)  # N*F
-        y0 = torch.concat([y0, y0], dim=0)
-        # print(y0.shape)
-        real_logits = (y0 - y_concat)  # N, 2N*F
-        # print(real_logits)
+        y0 = torch.concat([y0,y0],dim=0)
+        real_logits = (y0 - y_concat).reshape(N, -1)  # N, 2N*F
         real_logits = -torch.norm(real_logits, dim=-1) ** 2
-        real_logits = real_logits.reshape(N,-1)
-        real_logits = torch.exp(real_logits / temp)
-        real_logits =  -torch.log(torch.sum(real_logits,dim=-1)-1/temp)
-        # real_logits = func.log_softmax(real_logits / temp,dim=-1)
-        
-        # real_logits = torch.log(torch.sum(torch.exp(real_logits / temp),dim=-1))
-        
+        print("---------------------------------")
+        print(real_logits)
+        real_logits = torch.log(torch.sum(torch.exp(real_logits / temp),dim=-1))
+        print("---------------------------------")
+        print(real_logits)
+
+        print("Real Logits",real_logits.mean())
+
         # Negative Energy
         y_concat[torch.arange(N), torch.arange(N), :] = v
-        v = torch.concat([v, v], dim=0)
-        fake_logits = (v - y_concat)  # N, 2N*F
-        # # print("---------------Fake----------------------")
-        # # print(fake_logits)
-
-        # fake_logits = -torch.norm(fake_logits, dim=-1) ** 2
-        # fake_logits = func.log_softmax(fake_logits / temp,dim=-1)
-        # # fake_logits = torch.log(torch.sum(torch.exp(fake_logits / temp),dim=-1))
+        v = torch.concat([v,v],dim=0)
+        fake_logits = (v - y_concat).reshape(N, -1)  # N, 2N*F
         fake_logits = -torch.norm(fake_logits, dim=-1) ** 2
-        fake_logits = fake_logits.reshape(N,-1)
-        fake_logits = torch.exp(fake_logits / temp)
-        fake_logits =  -torch.log(torch.sum(fake_logits,dim=-1)-1/temp)
-        
+        fake_logits = torch.log(torch.sum(torch.exp(fake_logits / temp),dim=-1))
+        print("Fake Logits",fake_logits.mean())
+
         # Energy Loss
         energy_loss = lam * (fake_logits - real_logits)
         print("Contrastive",loss)
         print("Energy Loss",energy_loss.mean())
-        loss = loss - energy_loss.mean()
+        loss = loss + energy_loss.mean()
 
         # Loss Sum
         self.log('train_loss_ssl', loss)
